@@ -60,9 +60,16 @@ function text(cmd0::String="", arg1=nothing; first=true, kwargs...)
 	d, K, O = init_module(first, kwargs...)		# Also checks if the user wants ONLY the HELP mode
 	_text(wrapDatasets(cmd0, arg1), isa(arg1, Matrix), O, K, d)
 end
+function text(arg1::Matrix{<:Real}, text::Vector{<:AbstractString}; first=true, kwargs...)
+	# Method to allow calling text(Mat, ["A", "B", "C"])
+	size(arg1,1) != length(text) && error("Number of text elements and coordinates must be the same,")
+	d, K, O = init_module(first, kwargs...)
+	D = mat2ds(Float64.(arg1), text)
+	_text(wrapDatasets("", D), false, O, K, d)
+end
 function _text(w::wrapDatasets, ismatrix::Bool, O::Bool, K::Bool, d::Dict{Symbol,Any})
 	cmd0, arg1 = unwrapDatasets(w::wrapDatasets)
-	ismatrix && (arg1 = arg1.data)		# If the user sent in a Matrix, we need to extract the data for the text record (see Line 95)
+	ismatrix && (arg1 = arg1.data)		# If the user sent in a Matrix, we need to extract the data for the text record (see Line 102)
 
 	(is_in_dict(d, [:L :list]) !== nothing) && return gmt("pstext -L")
 
