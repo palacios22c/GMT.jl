@@ -391,6 +391,9 @@ using .Laszip
 	coast(R=:g, proj=:guess, W=(level=1, pen=(2, :green)), savefig=tempname()*".ps")
 	rm(t)
 	D = mat2ds(rand(3, 3), colnames=["Time", "b", "c"])
+	pts = [1.0 1.0; 1.05 1.05; 0.95 1.0; 1.0 0.95; 1.05 0.95];
+	labs = ["Aa", "Bb", "Cc", "Dd", "Ee"];
+	mat2ds(pts, labs);
 	D.attrib = Dict("Timecol" => "1")
 	D[:Time]
 	D["Time", "b"]

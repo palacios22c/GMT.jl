@@ -2795,8 +2795,9 @@ function get_cpt_set_R(d::Dict{Symbol,Any}, cmd0::String, cmd::String, opt_R::St
 		val, symb = find_in_dict(d, CPTaliases, false)
 		if (isempty(CURRENT_CPT[]) && val === nothing)
 			# If no cpt name sent in, then compute (later) a default cpt
-			if (isa(arg1, GMTgrid) && ((val = find_in_dict(d, [:percent :pct])[1])) !== nothing)
-				lh = quantile(any(!isfinite, arg1) ? skipnan(vec(arg1)) : vec(arg1), [(100 - val)/200, (1 - (100 - val)/200)])
+			pct = hlp_desnany_float(d, [:percent :pct])
+			if (isa(arg1, GMTgrid) && (!isnan(pct)))
+				lh = quantile(any(!isfinite, arg1) ? skipnan(vec(arg1)) : vec(arg1), [pct/200, (1 - pct/200)])
 				cpt_opt_T = @sprintf(" -T%.12g/%.12g/256+n -D", lh[1], lh[2])	# Piggyback -D
 			elseif ((val = find_in_dict(d, [:percent :pct])[1]) !== nothing)	# Case of a grid file
 				range = vec(grdinfo(cmd0 * " -C -T+a$(100-val)"::String).data);
