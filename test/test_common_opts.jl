@@ -72,6 +72,8 @@
 	@test GMT.parse_J(Dict{Symbol,Any}(:J => (name=:Cyl_,center=(0,45))), "", default="", map=false)[1] == " -JCyl_stere/0/45"
 	@test_throws ErrorException("When projection arguments are in a NamedTuple the projection 'name' keyword is madatory.") GMT.parse_J(Dict{Symbol,Any}(:J => (parallels=[45 65],)), "", default="", map=false)
 	@test_throws ErrorException("When projection is a named tuple you need to specify also 'center' and|or 'parallels'") GMT.parse_J(Dict{Symbol,Any}(:J => (name=:merc,)), "", default="", map=false)
+	basemap(R=:d, proj=:guess, figsize=8);
+	@test basemap!(R=:d, X=10, B=:same, proj=:guess, show=1, Vd=2) == "psbasemap  -Rd -JN0.0/8 -B -X10"
 	r = GMT.parse_params(Dict{Symbol,Any}(:par => (MAP_FRAME_WIDTH=0.2, IO=:lixo, OI="xoli")), "");
 	@test r == " --MAP_FRAME_WIDTH=0.2 --IO=lixo --OI=xoli"
 	@test GMT.parse_params(Dict{Symbol,Any}(:par => (:MAP_FRAME_WIDTH,0.2)), "") == " --MAP_FRAME_WIDTH=0.2"
