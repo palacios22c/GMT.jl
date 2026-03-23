@@ -386,7 +386,7 @@ end
 
 # --------------------------------------------------------------------------------------------------
 """
-    best_label_pos(curves, labels; fontsize=10, plotsize=(15,10)) -> Vector{NamedTuple}
+    best_label_pos(curves, labels; fontsize::Int=8) -> Vector{NamedTuple}
 
 Find optimal non-overlapping positions to annotate curves in an x-y plot. For each curve, tests
 candidate positions along 10%–90% of the arc length, scores them by overlap with other curves and
@@ -395,22 +395,38 @@ already-placed labels, and greedily assigns the best position.
 ### Arguments
 - `curves`: data curves. A Nx2+ matrix, a GMTdataset, or a Vector of these.
 - `labels`: Vector of label strings, one per curve.
-- `fontsize`: font size in points (default 10). Used to estimate text bounding box.
-- `plotsize`: plot dimensions in cm as `(width, height)` (default `(15, 10)`).
+- `fontsize`: font size in points (default 8). Used to estimate text bounding box.
 - `prefer`: preferred label zone along the curve. One of `:begin`, `:middle` (default), or `:end`.
+- `xvals`: scalar or vector of x-coordinates where labels should be placed (by intersecting each curve).
+  A scalar uses the same x for all curves; a vector specifies one x per curve.
+- `yvals`: same as `xvals` but for y-coordinates. If multiple crossings exist, the one closest to the
+  curve midpoint is chosen.
 
 ### Returns
 A `Matrix{Float64}` of size `(ncurves, 4)` where each row `[x1, y1, x2, y2]` defines a short
 line segment perpendicular to the curve at the chosen label position, in data coordinates.
 These can be used directly with GMT's quoted line option `-Sql<x1/y1/x2/y2>`.
 """
-function best_label_pos(curves::GDtype, labels::Vector{<:AbstractString}; fontsize::Real=10, plotsize=(15,10), prefer::Symbol=:middle)
-	D = isa(curves, GMTdataset) ? [curves] : curves
+function best_label_pos(curves::GDtype, labels::Vector{<:AbstractString}; fontsize::Int=8, prefer::Symbol=:middle,
+                        xvals::Union{Real, Vector{<:Real}, Nothing}=nothing, yvals::Union{Real, Vector{<:Real}, Nothing}=nothing)
+	D = isa(curves, GMTdataset) ? [curves] : (isa(curves, Vector{<:GMTdataset}) ? curves : [curves])
 	nc = length(D)
-	nc != length(labels) && error("Number of curves ($nc) must match number of labels ($(length(labels)))")
+	_labels = String[string(l) for l in labels]
+	nc != length(_labels) && error("Number of curves ($nc) must match number of labels ($(length(_labels)))")
 
-	xmin, xmax, ymin, ymax = getregion(curves)
-	pw, ph = Float64(plotsize[1]), Float64(plotsize[2])
+	# If xvals or yvals provided, place labels at those specific coordinates
+	if xvals !== nothing || yvals !== nothing
+		_xv::Vector{Float64} = xvals === nothing ? Float64[] : isa(xvals, Real) ? fill(Float64(xvals), nc) : Float64.(xvals)
+		_yv::Vector{Float64} = yvals === nothing ? Float64[] : isa(yvals, Real) ? fill(Float64(yvals), nc) : Float64.(yvals)
+		return _label_pos_at_vals(D, nc, _xv, _yv)
+	end
+
+	_best_label_pos(D, _labels, nc, Int(fontsize), prefer)
+end
+
+function _best_label_pos(D::Vector{<:GMTdataset}, labels::Vector{String}, nc::Int, fontsize::Int, prefer::Symbol)
+	xmin, xmax, ymin, ymax = getregion(D)
+	pw, ph = _get_plotsize()
 	sx, sy = pw / (xmax - xmin), ph / (ymax - ymin)
 
 	# Convert to cm space for accurate visual distance/angle calculations
@@ -442,16 +458,21 @@ function best_label_pos(curves::GDtype, labels::Vector{<:AbstractString}; fontsi
 
 	for i in 1:nc
 		hw_i = hws[i]
-		best_score, best_j = -Inf, 1
-		for j in eachindex(cands[i])
-			cx, cy, ang, curv = cands[i][j]
 
-			# Penalize high curvature zones — prefer smooth sections
-			curv > 0.5 && (continue)			# skip very sharp bends (> ~30°)
-			curv_penalty = curv * 2.0			# continuous penalty for moderate curvature
+		# Phase 1: compute a quality score for every candidate (higher = fewer problems)
+		nj = length(cands[i])
+		qualities = Vector{Float64}(undef, nj)
+		curvs     = Vector{Float64}(undef, nj)
+		fracs     = Vector{Float64}(undef, nj)
+
+		for j in 1:nj
+			cx, cy, ang, curv = cands[i][j]
+			fracs[j] = frac_lo + (frac_hi - frac_lo) * (j - 1) / max(nj - 1, 1)
+			quality = 0.0
+			curvs[j] = curv
 
 			# Min distance from (cx,cy) to any segment of any other curve
-			clearance = 1e10
+			clearance = nc > 1 ? 1e10 : 0.0
 			for k in 1:nc
 				k == i && continue
 				c = crv[k];  n = size(c, 1)
@@ -461,28 +482,56 @@ function best_label_pos(curves::GDtype, labels::Vector{<:AbstractString}; fontsi
 				end
 			end
 
-			# Reject if perpendicular crosses own curve more than once
+			# Penalty when another curve is very close to the label center
+			if clearance < hh * 2
+				quality -= (hh * 2 - clearance) * 10.0
+			end
+
+			# Penalty if perpendicular crosses own curve more than once
 			nx, ny = -sin(ang), cos(ang)
 			x1c, y1c = cx - nx * half_cross, cy - ny * half_cross
 			x2c, y2c = cx + nx * half_cross, cy + ny * half_cross
-			if _bla_crossing_count(x1c, y1c, x2c, y2c, crv[i]) > 1
-				continue
-			end
+			nself = _bla_crossing_count(x1c, y1c, x2c, y2c, crv[i])
+			nself > 1 && (quality -= nself * 20.0)
 
-			# Kill candidates that overlap with already-placed labels
-			for p in eachindex(placed_cx)
-				if _bla_rboxes_overlap(cx, cy, ang, hw_i, hh,
-				                       placed_cx[p], placed_cy[p], placed_a[p], placed_hw[p], placed_hh[p])
-					clearance = -1.0;  break
+			# Penalty if any OTHER curve crosses through the label bounding box
+			if nc > 1
+				corners = _bla_corners(cx, cy, ang, hw_i * 1.3, hh * 1.3)
+				for k in 1:nc
+					k == i && continue
+					for ei in 1:4
+						eni = mod1(ei + 1, 4)
+						ncx = _bla_crossing_count(corners[ei][1], corners[ei][2], corners[eni][1], corners[eni][2], crv[k])
+						ncx > 0 && (quality -= ncx * 30.0)
+					end
 				end
 			end
 
-			# Score = clearance - curvature penalty, with preference-zone tiebreaker
-			frac = frac_lo + (frac_hi - frac_lo) * (j - 1) / (ncand - 1)
-			score = clearance - curv_penalty - abs(frac - frac_target) * 0.01
+			# Penalty for overlap with already-placed labels
+			for p in eachindex(placed_cx)
+				if _bla_rboxes_overlap(cx, cy, ang, hw_i, hh,
+				                       placed_cx[p], placed_cy[p], placed_a[p], placed_hw[p], placed_hh[p])
+					quality -= 100.0;  break
+				end
+			end
 
-			if (score > best_score)
-				best_score = score;  best_j = j
+			qualities[j] = quality
+		end
+
+		# Phase 2: among candidates with acceptable quality, pick the best balance of
+		# proximity to frac_target and low curvature (prefer straight sections).
+		best_quality = maximum(qualities)
+		threshold = best_quality - 5.0
+
+		best_j = 1
+		best_score2 = -Inf
+		for j in 1:nj
+			qualities[j] < threshold && continue
+			frac_dist = abs(fracs[j] - frac_target)		# 0..0.4 typically
+			score2 = -frac_dist * 10.0 - curvs[j] * 8.0	# balance preference vs curvature
+			if score2 > best_score2
+				best_score2 = score2
+				best_j = j
 			end
 		end
 
@@ -496,6 +545,61 @@ function best_label_pos(curves::GDtype, labels::Vector{<:AbstractString}; fontsi
 		result[i,2] = (cy - ny * half_cross) / sy + ymin
 		result[i,3] = (cx + nx * half_cross) / sx + xmin
 		result[i,4] = (cy + ny * half_cross) / sy + ymin
+	end
+	return result
+end
+
+# Place labels at user-specified x or y coordinates by interpolating each curve.
+function _label_pos_at_vals(D::Vector{<:GMTdataset}, nc::Int, xvals::Vector{Float64}, yvals::Vector{Float64})
+	half_cross = 0.3
+	result = Matrix{Float64}(undef, nc, 4)
+	use_x = !isempty(xvals)
+	vv = use_x ? xvals : yvals
+	length(vv) != nc && error("Length of $(use_x ? "xvals" : "yvals") ($(length(vv))) must match number of curves ($nc)")
+	col_interp = use_x ? 1 : 2		# column to search in
+	col_result = use_x ? 2 : 1		# column to interpolate
+
+	for i in 1:nc
+		data = D[i].data
+		n = size(data, 1)
+		target = vv[i]
+
+		# Find all segments that bracket the target value
+		best_px, best_py, best_ang = 0.0, 0.0, 0.0
+		best_dist = Inf				# distance to curve midpoint (by index)
+		mid_idx = n / 2.0
+		found = false
+
+		@inbounds for s in 1:n-1
+			v1, v2 = data[s, col_interp], data[s+1, col_interp]
+			(min(v1, v2) > target || max(v1, v2) < target) && continue
+			dv = v2 - v1
+			t = dv != 0.0 ? (target - v1) / dv : 0.5
+			t = clamp(t, 0.0, 1.0)
+			px = data[s,1] + t * (data[s+1,1] - data[s,1])
+			py = data[s,2] + t * (data[s+1,2] - data[s,2])
+			ang = atan(data[s+1,2] - data[s,2], data[s+1,1] - data[s,1])
+			dist = abs(s + t - mid_idx)
+			if dist < best_dist
+				best_px, best_py, best_ang = px, py, ang
+				best_dist = dist
+				found = true
+			end
+		end
+
+		!found && error("Value $(target) not found on curve $i")
+
+		# Build short perpendicular segment in data coordinates
+		# Use a small delta based on data range
+		dx = data[end,1] - data[1,1]
+		dy = data[end,2] - data[1,2]
+		scale = max(abs(dx), abs(dy)) * 0.005
+		scale = max(scale, 1e-6)
+		nx, ny = -sin(best_ang), cos(best_ang)
+		result[i,1] = best_px - nx * scale
+		result[i,2] = best_py - ny * scale
+		result[i,3] = best_px + nx * scale
+		result[i,4] = best_py + ny * scale
 	end
 	return result
 end
@@ -548,15 +652,17 @@ function _bla_gen_candidates(c::Matrix{Float64}, ncand::Int, frac_lo::Float64=0.
 		i1 = max(1, idx - 2)
 		i2 = min(n, idx + 3)
 		ang = atan(c[i2,2] - c[i1,2], c[i2,1] - c[i1,1])
-		# Curvature: max absolute angle change between consecutive segments in a local window
-		w1 = max(1, idx - 3)
-		w2 = min(n - 1, idx + 3)
+		# Curvature: mean absolute angle change between consecutive segments in a ±1 window
+		w1 = max(1, idx - 1)
+		w2 = min(n - 1, idx + 1)
 		curv = 0.0
+		nw = 0
 		for k in w1:w2-1
 			da = abs(seg_ang[k+1] - seg_ang[k])
 			da > π && (da = 2π - da)		# wrap
-			curv = max(curv, da)
+			curv += da;  nw += 1
 		end
+		curv = nw > 0 ? curv / nw : 0.0
 		result[j] = (px, py, ang, curv)
 	end
 	return result
@@ -610,8 +716,145 @@ end
 
 # --------------------------------------------------------------------------------------------------
 """
-    text_repel(points, labels; fontsize=10, plotregion=nothing, plotsize=(15,10),
-               force_push=1.0, force_pull=0.01, max_iter=500, padding=0.15) -> Matrix{Float64}
+    add_labellines(curves, val)
+
+Add inline curve labels using GMT's quoted line option `-Sq` in segment headers.
+Called from `_common_plot_xyz()` when the `labellines` keyword is used.
+
+- `val` can be a `Vector{<:AbstractString}` with one label per curve, or a NamedTuple with fields
+  `labels` (required), `fontsize` (default 8), and `prefer` (`:begin`, `:middle`, or `:end`; default `:middle`).
+"""
+function add_labellines!(curves, d::Dict{Symbol,Any}, _cmd::Vector{String})
+	val = find_in_dict(d, [:labellines])[1]
+	if isa(val, Vector{<:AbstractString})
+		_add_labellines(curves, _cmd, [string(l) for l in val], 8, :middle)
+		return curves
+	end
+	# NamedTuple path — dispatch to the right inner function based on which options are set
+	dd = nt2dict(val)
+	labels::Vector{String} = [string(l) for l in dd[:labels]::Vector]
+	fnt = Int(get(dd, :fontsize, 8))
+	prefer = Symbol(get(dd, :prefer, :middle))
+	if get(dd, :outside, false) == true
+		_inject_outside_labels!(d, curves, labels, fnt, _cmd)
+		return curves
+	end
+	xv = get(dd, :xvals, nothing)
+	yv = get(dd, :yvals, nothing)
+	if xv !== nothing || yv !== nothing
+		nc = length(curves)
+		_xv::Vector{Float64} = xv === nothing ? Float64[] : isa(xv, Real) ? fill(Float64(xv), nc) : Float64.(xv)
+		_yv::Vector{Float64} = yv === nothing ? Float64[] : isa(yv, Real) ? fill(Float64(yv), nc) : Float64.(yv)
+		pos = _label_pos_at_vals(curves, nc, _xv, _yv)
+		_add_labellines_apply(curves, _cmd, labels, fnt, pos)
+		return curves
+	end
+	_add_labellines(curves, _cmd, labels, fnt, prefer)
+	return curves
+end
+
+function _add_labellines(arg1::Vector{<:GMTdataset}, _cmd::Vector{String}, labels::Vector{String}, fontsize::Int, prefer::Symbol)
+	pos = best_label_pos(arg1, labels; fontsize=fontsize, prefer=prefer)
+	_add_labellines_apply(arg1, _cmd, labels, fontsize, pos)
+end
+
+function _add_labellines_apply(arg1::Vector{<:GMTdataset}, _cmd::Vector{String}, labels::Vector{String}, fontsize::Int, pos::Matrix{Float64})
+	_cmd[1] *= " -Sq"
+	for k in 1:length(labels)
+		color = _extract_W_color(arg1[k].header)
+		font = color != "" ? "$(fontsize)p,,$color" : "$(fontsize)p"
+		lbl = occursin(' ', labels[k]) ? "\"$(labels[k])\"" : labels[k]
+		sq = @sprintf("-Sql%.10g/%.10g/%.10g/%.10g:+l%s+f%s+v", pos[k,1], pos[k,2], pos[k,3], pos[k,4], lbl, font)
+		hdr = arg1[k].header
+		hdr = replace(hdr, r" -Sq(?:[^\s\"]|\"[^\"]*\")*" => "")	# Remove any previous -Sq option
+		arg1[k].header = string(hdr, " ", sq)
+	end
+end
+
+# Inject outside labels into d[:text] so they are processed by finish_PS_nested as a nested text call.
+function _inject_outside_labels!(d::Dict{Symbol,Any}, D::Vector{<:GMTdataset}, labels::Vector{String}, fontsize::Int, _cmd::Vector{String})
+	info = _outside_label_data(D, labels, fontsize, _has_right_axis(_cmd[1]))
+	Dt = mat2ds(hcat(info.x, info.y), info.labels)
+	color = info.colors[1]
+	fnt = color != "" ? "$(fontsize)p,,$color" : "$(fontsize)p"
+	d[:text] = (data=Dt, font=fnt, justify="ML", offset=(0.15, 0.0), noclip=true)
+end
+
+# Check if the right axis frame is drawn by looking for 'E', 'e' or 'r' in the -B axes spec.
+function _has_right_axis(cmd::String)::Bool
+	# Find -B options that specify axes (contain frame letters, not just intervals like -Baf)
+	for m in eachmatch(r"-B([A-Za-z]*)", cmd)
+		s = m.captures[1]
+		# Axes specs contain W/w/S/s/E/e/N/n/l/r/t/b/u/d  — skip pure interval specs like "af", "xaf", "p"
+		any(c -> c in "WSENwsen", s) && return any(c -> c in "Ee", s)
+	end
+	return false		# No axes spec found, default frames don't draw right axis
+end
+
+# Compute label positions outside the plot (at the right edge), with vertical repel to avoid overlaps.
+function _outside_label_data(D::Vector{<:GMTdataset}, labels::Vector{String}, fontsize::Int, right_axis::Bool)
+	nc = length(D)
+
+	# Get plot region limits from CTRL.pocket_R  e.g. " -R0/10/-1.5/1.5"
+	r = split(CTRL.pocket_R[1][4:end], '/')		# skip " -R"
+	ymin = parse(Float64, r[3])
+	ymax = parse(Float64, r[4])
+
+	# x positions: at plot region edge if right axis is drawn, otherwise at each curve's last point
+	xs = Vector{Float64}(undef, nc)
+	ys = Vector{Float64}(undef, nc)
+	colors = Vector{String}(undef, nc)
+	if right_axis
+		xmax = parse(Float64, r[2])
+		for k in 1:nc
+			xs[k] = xmax
+			ys[k] = D[k].data[end, 2]
+			colors[k] = _extract_W_color(D[k].header)
+		end
+	else
+		for k in 1:nc
+			xs[k] = D[k].data[end, 1]
+			ys[k] = D[k].data[end, 2]
+			colors[k] = _extract_W_color(D[k].header)
+		end
+	end
+
+	# Repel overlapping labels vertically
+	pw, ph = _get_plotsize()
+	sy = ph / (ymax - ymin)
+	pt2cm = 2.54 / 72
+	label_h = fontsize * pt2cm * 1.4		# label height in cm with some padding
+	min_sep = label_h / sy					# minimum separation in data units
+
+	order = sortperm(ys)
+	ys_sorted = ys[order]
+	for i in 2:nc
+		if (ys_sorted[i] - ys_sorted[i-1] < min_sep)
+			ys_sorted[i] = ys_sorted[i-1] + min_sep
+		end
+	end
+	shift = (sum(ys[order]) - sum(ys_sorted)) / nc
+	ys_sorted .+= shift
+	for i in eachindex(order)
+		ys[order[i]] = ys_sorted[i]
+	end
+
+	return (x=xs, y=ys, labels=labels, fontsize=fontsize, colors=colors)
+end
+
+# Extract the color component from a -W option in a GMT header string.
+# -W can have forms like: -W0.5,red  -W,blue  -W1p,red,dash  -W0.5,200/100/50
+# The color is the second comma-separated field after -W.
+function _extract_W_color(header::AbstractString)::String
+	m = match(r"-W([^, ]*),([^, ]+)", header)
+	m === nothing && return ""
+	return String(m.captures[2])
+end
+
+# --------------------------------------------------------------------------------------------------
+"""
+    text_repel(points, labels; fontsize=10, force_push=1.0, force_pull=0.01,
+               max_iter=500, padding=0.15) -> Matrix{Float64}
 
 Compute adjusted text label positions so that they do not overlap each other or the data points,
 similar to R's `ggrepel`. Uses a force-directed simulation: labels repel each other and data points
@@ -621,8 +864,6 @@ similar to R's `ggrepel`. Uses a force-directed simulation: labels repel each ot
 - `points`: Nx2 matrix or GMTdataset with (x,y) anchor points.
 - `labels`: Vector of label strings, one per point.
 - `fontsize`: font size in points (default 10).
-- `plotregion`: `(xmin, xmax, ymin, ymax)`. If `nothing`, computed from points with 5% margin.
-- `plotsize`: plot dimensions in cm as `(width, height)` (default `(15, 10)`).
 - `force_push`: repulsion strength multiplier (default 1.0).
 - `force_pull`: attraction strength back to anchor (default 0.01).
 - `max_iter`: maximum number of simulation iterations (default 500).
@@ -631,9 +872,8 @@ similar to R's `ggrepel`. Uses a force-directed simulation: labels repel each ot
 ### Returns
 A `Matrix{Float64}` of size `(N, 2)` with adjusted `(x, y)` positions in data coordinates.
 """
-function text_repel(points, labels::Vector{<:AbstractString}; fontsize::Real=10, plotregion=nothing,
-                    plotsize=(15,10), force_push::Real=1.0, force_pull::Real=0.01,
-                    max_iter::Int=500, padding::Real=0.15)
+function text_repel(points, labels::Vector{<:AbstractString}; fontsize::Int=10,
+                    force_push::Real=1.0, force_pull::Real=0.01, max_iter::Int=500, padding::Real=0.15)
 
 	# Extract point coordinates
 	if isa(points, GMTdataset)
@@ -646,16 +886,17 @@ function text_repel(points, labels::Vector{<:AbstractString}; fontsize::Real=10,
 	n = length(px)
 	n != length(labels) && error("Number of points ($n) must match number of labels ($(length(labels)))")
 
-	# Plot region
-	if plotregion === nothing
-		_xmin, _xmax = extrema(px);  _ymin, _ymax = extrema(py)
-		mx, my = (_xmax - _xmin) * 0.05, (_ymax - _ymin) * 0.05
-		xmin, xmax, ymin, ymax = _xmin - mx, _xmax + mx, _ymin - my, _ymax + my
-	else
-		xmin, xmax, ymin, ymax = Float64(plotregion[1]), Float64(plotregion[2]), Float64(plotregion[3]), Float64(plotregion[4])
-	end
-	pw, ph = Float64(plotsize[1]), Float64(plotsize[2])
-	sx, sy = pw / (xmax - xmin), ph / (ymax - ymin)
+	# Plot region from CTRL.limits, fallback to data bbox
+	xmin, xmax, ymin, ymax = (CTRL.limits[7] != 0 || CTRL.limits[8] != 0) ?
+	                         (CTRL.limits[7], CTRL.limits[8], CTRL.limits[9], CTRL.limits[10]) :
+	                         (CTRL.limits[1] != CTRL.limits[2]) ?
+	                         (CTRL.limits[1], CTRL.limits[2], CTRL.limits[3], CTRL.limits[4]) :
+	                         (minimum(px), maximum(px), minimum(py), maximum(py))
+	dx = xmax - xmin;  dy = ymax - ymin
+	(dx == 0) && (xmin -= 0.5; xmax += 0.5; dx = 1.0)
+	(dy == 0) && (ymin -= 0.5; ymax += 0.5; dy = 1.0)
+	pw, ph = _get_plotsize()
+	sx, sy = pw / dx, ph / dy
 
 	# Convert anchor points to cm space
 	ax = (px .- xmin) .* sx
@@ -740,4 +981,23 @@ function text_repel(points, labels::Vector{<:AbstractString}; fontsize::Real=10,
 		result[i, 2] = ly[i] / sy + ymin
 	end
 	return result
+end
+
+# --------------------------------------------------------------------------------------------------
+function _get_plotsize()::Tuple{Float64, Float64}
+	# Parse the plot size from CTRL.pocket_J[2] (e.g., "15c/10c" or "15c")
+	s = CTRL.pocket_J[2]
+	(s == "") && (s = DEF_FIG_SIZE)
+	parts = split(s, '/')
+	w_str = parts[1]
+	isletter(w_str[end]) && (w_str = w_str[1:end-1])
+	W = parse(Float64, w_str)
+	if length(parts) == 2 && parts[2] != "0"
+		h_str = parts[2]
+		isletter(h_str[end]) && (h_str = h_str[1:end-1])
+		H = parse(Float64, h_str)
+	else
+		H = W * 2 / 3		# Default aspect ratio
+	end
+	return (W, H)
 end
