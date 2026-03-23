@@ -231,6 +231,8 @@ function _common_plot_xyz(w::wrapDatasets, caller::String, O::Bool, K::Bool, is3
 			(@warn("Can't plot the connector when 'bar' is already a nested call."); pocket_call[][3] = nothing))
 	end
 
+	haskey(d, :labellines) && (arg1 = add_labellines!(arg1, d, _cmd))
+
 	(!IamModern[]) && put_in_legend_bag(d, _cmd, arg1, O, opt_l)
 
 	_cmd = gmt_proggy .* _cmd				# In any case we need this
@@ -251,7 +253,6 @@ function _common_plot_xyz(w::wrapDatasets, caller::String, O::Bool, K::Bool, is3
 	_cmd = fish_pagebg(d, _cmd, autoJZ=(is3D && axis_equal))	# Last arg tells if JZ was computed automatically	# FORCES RECOMPILE
 
 	isa(arg1, GDtype) && plt_txt_attrib!(arg1, d, _cmd)			# Function barrier to plot TEXT attributed labels (in case)
-
 	finish = (is_ternary && occursin(" -M",_cmd[1])) ? false : true		# But this case (-M) is bugged still in 6.2.0
 	((r = check_dbg_print_cmd(d, _cmd)) !== nothing) && return r		# FORCES RECOMPILE
 	R = prep_and_call_finish_PS_module(d, _cmd, "", K, O, finish, arg1, arg2, arg3, arg4)

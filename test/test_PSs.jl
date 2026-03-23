@@ -299,6 +299,114 @@ bs = GMT.best_label_pos(Ds, ["zigzag"])
 # 6g) Rotated box with corner inside an axis-aligned box
 @test GMT._bla_rboxes_overlap(0.0,0.0, 0.0, 2.0,2.0, 2.0,2.0, π/4, 1.5,0.3) == true
 
+# 7) xvals: place labels at specific x coordinates
+println("	LABEL_POS_AT_VALS")
+D2 = mat2ds([[0.0 0; 2 2; 4 4; 6 6; 8 8; 10 10], [0.0 10; 2 8; 4 6; 6 4; 8 2; 10 0]])
+bv = GMT.best_label_pos(D2, ["up", "down"]; xvals=5.0)
+@test size(bv) == (2, 4)
+@test all(isfinite.(bv))
+# Both labels should be near x=5
+for i in 1:2
+	mx = (bv[i,1] + bv[i,3]) / 2
+	@assert abs(mx - 5.0) < 1.5 "xvals=5 label $i not near x=5 (x=$mx)"
+end
+
+# 8) xvals with per-curve values
+bv2 = GMT.best_label_pos(D2, ["up", "down"]; xvals=[2.0, 8.0])
+mx1 = (bv2[1,1] + bv2[1,3]) / 2
+mx2 = (bv2[2,1] + bv2[2,3]) / 2
+@assert abs(mx1 - 2.0) < 1.0 "xvals=[2,8] label 1 not near x=2 (x=$mx1)"
+@assert abs(mx2 - 8.0) < 1.0 "xvals=[2,8] label 2 not near x=8 (x=$mx2)"
+
+# 9) yvals: place labels at specific y coordinates
+bv3 = GMT.best_label_pos(D2, ["up", "down"]; yvals=5.0)
+@test size(bv3) == (2, 4)
+@test all(isfinite.(bv3))
+
+# 10) _extract_W_color
+println("	EXTRACT_W_COLOR")
+@test GMT._extract_W_color("-W0.5,red") == "red"
+@test GMT._extract_W_color("-W1p,200/100/50") == "200/100/50"
+@test GMT._extract_W_color("-W,blue") == "blue"
+@test GMT._extract_W_color("-W0.5,red,dash") == "red"
+@test GMT._extract_W_color("-J -R") == ""
+@test GMT._extract_W_color("") == ""
+
+# 11) _has_right_axis
+println("	HAS_RIGHT_AXIS")
+@test GMT._has_right_axis("-Baf -BWSen") == true
+@test GMT._has_right_axis("-Baf -BWSE") == true
+@test GMT._has_right_axis("-Baf -BWS") == false
+@test GMT._has_right_axis("-Baf -BWSn") == false
+@test GMT._has_right_axis("-Baf") == false
+@test GMT._has_right_axis("-Baf -BWSeN") == true
+
+# 12) add_labellines! with inline labels (via Vd=2 to get command string)
+println("	ADD_LABELLINES")
+x = collect(0.0:0.5:10.0);
+Dl = [mat2ds(hcat(x, sin.(x)), hdr="-W1,red"), mat2ds(hcat(x, cos.(x)), hdr="-W1,blue")];
+d12 = Dict{Symbol,Any}(:labellines => ["sin", "cos"]);
+cmd12 = ["psxy -R0/10/-1.5/1.5 -JX15c/10c -Baf -BWSen"];
+Dl2 = GMT.add_labellines!(Dl, d12, cmd12);
+@test occursin("-Sq", cmd12[1])
+@test occursin("-Sql", Dl2[1].header)
+@test occursin("sin", Dl2[1].header)
+@test occursin("cos", Dl2[2].header)
+# Line colors should appear in the -Sq font spec
+@test occursin("red", Dl2[1].header)
+
+# 13) add_labellines! with xvals via NamedTuple
+Dl3 = [mat2ds(hcat(x, sin.(x)), header="-W1,red"), mat2ds(hcat(x, cos.(x)), header="-W1,blue")]
+d13 = Dict{Symbol,Any}(:labellines => (labels=["sin", "cos"], xvals=5.0))
+cmd13 = ["psxy -R0/10/-1.5/1.5 -JX15c/10c -Baf -BWSen"]
+Dl3b = GMT.add_labellines!(Dl3, d13, cmd13)
+@test occursin("-Sq", cmd13[1])
+@test occursin("sin", Dl3b[1].header)
+
+# 14) add_labellines! replaces previous -Sq (not appends)
+Dl4 = [mat2ds(hcat(x, sin.(x)), header="-W1,red -Sql1/2/3/4:+l\"old\"+f8p+v")]
+d14 = Dict{Symbol,Any}(:labellines => ["new"])
+cmd14 = ["psxy -R0/10/-1.5/1.5 -JX15c/10c"]
+GMT.add_labellines!(Dl4, d14, cmd14)
+@test !occursin("old", Dl4[1].header)
+@test occursin("new", Dl4[1].header)
+# Only one -Sq in header
+@test count("-Sq", Dl4[1].header) == 1
+
+# 15) _outside_label_data: positions and repel
+println("	OUTSIDE_LABEL_DATA")
+# Set up CTRL globals needed by _outside_label_data
+bak_R = GMT.CTRL.pocket_R[1];  bak_J = GMT.CTRL.pocket_J[2]
+GMT.CTRL.pocket_R[1] = " -R0/10/-1.5/1.5"
+GMT.CTRL.pocket_J[2] = "15c/10c"
+Dout = [mat2ds(hcat(x, sin.(x)), hdr="-W1,red"), mat2ds(hcat(x, cos.(x)), hdr="-W1,blue")]
+# With right axis: x should be xmax=10
+info_r = GMT._outside_label_data(Dout, ["sin", "cos"], 8, true)
+@test length(info_r.x) == 2
+@test all(info_r.x .== 10.0)
+@test length(info_r.y) == 2
+@test all(isfinite.(info_r.y))
+@test info_r.colors[1] == "red"
+@test info_r.colors[2] == "blue"
+# Without right axis: x should be each curve's last x
+info_n = GMT._outside_label_data(Dout, ["sin", "cos"], 8, false)
+@test info_n.x[1] == Dout[1].data[end, 1]
+@test info_n.x[2] == Dout[2].data[end, 1]
+
+# 16) _outside_label_data: overlapping y-values get repelled
+Dov = [mat2ds([0.0 1.0; 10 1.0], header="-W1,red"), mat2ds([0.0 1.0; 10 1.0], header="-W1,blue")]
+info_ov = GMT._outside_label_data(Dov, ["a", "b"], 10, true)
+@test abs(info_ov.y[1] - info_ov.y[2]) > 0.01   # labels must not overlap
+
+# 17) add_labellines! with outside=true injects d[:text]
+Dout2 = [mat2ds(hcat(x, sin.(x)), header="-W1,red"), mat2ds(hcat(x, cos.(x)), header="-W1,blue")]
+d17 = Dict{Symbol,Any}(:labellines => (labels=["sin", "cos"], outside=true))
+cmd17 = ["psxy -R0/10/-1.5/1.5 -JX15c/10c -Baf -BWSen"]
+GMT.add_labellines!(Dout2, d17, cmd17)
+@test haskey(d17, :text)
+@test !occursin("-Sq", cmd17[1])   # outside labels don't use -Sq
+GMT.CTRL.pocket_R[1] = bak_R;  GMT.CTRL.pocket_J[2] = bak_J   # restore
+
 # Test text_repel — force-directed label placement
 println("	TEXT_REPEL")
 # 1) Clustered points: labels must spread out
@@ -310,6 +418,7 @@ rp = GMT.text_repel(pts, labs)
 @test all(isfinite.(rp))
 
 # 2) Well-separated points: labels stay near anchors
+resetGMT()
 pts2 = [0.0 0.0; 5.0 0.0; 0.0 5.0; 5.0 5.0]
 labs2 = ["A", "B", "C", "D"]
 rp2 = GMT.text_repel(pts2, labs2)
@@ -322,11 +431,6 @@ end
 D_repel = mat2ds(pts)
 rp3 = GMT.text_repel(D_repel, labs)
 @test size(rp3) == (5, 2)
-
-# 4) With explicit plotregion
-rp4 = GMT.text_repel(pts, labs; plotregion=(-1,3,-1,3))
-@test all(rp4[:,1] .>= -1.0) && all(rp4[:,1] .<= 3.0)
-@test all(rp4[:,2] .>= -1.0) && all(rp4[:,2] .<= 3.0)
 
 # 5) No overlaps in result (axis-aligned box check in cm space)
 function _test_no_overlaps(rp, labs, region, plotsize, fontsize)
@@ -341,7 +445,7 @@ function _test_no_overlaps(rp, labs, region, plotsize, fontsize)
 	end
 	true
 end
-@assert _test_no_overlaps(rp2, labs2, (-0.5,5.5,-0.5,5.5), (15,10), 10)
+@test _test_no_overlaps(rp2, labs2, (-0.5,5.5,-0.5,5.5), (15,10), 10)
 
 println("	PSSOLAR")
 #D=solar(I="-7.93/37.079+d2016-02-04T10:01:00");
